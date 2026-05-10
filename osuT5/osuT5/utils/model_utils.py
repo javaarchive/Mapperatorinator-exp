@@ -343,12 +343,22 @@ def get_dataset(args: TrainConfig, **kwargs) -> IterableDataset:
     elif args.data.dataset_type == "web":
         from ..dataset.web_dataset import WebDataset
         return WebDataset(args=args.data, **kwargs)
+    elif args.data.dataset_type == "sm":
+        from ..dataset.sm_dataset import StepmaniaDataset
+        return StepmaniaDataset(args=args.data, **kwargs)
     else:
         raise NotImplementedError
 
 
 def get_dataloaders(tokenizer: Tokenizer, args: TrainConfig, shared: Namespace) -> tuple[DataLoader, DataLoader]:
     parser = OsuParser(args, tokenizer)
+    
+    if args.data.dataset_type == "sm":
+        from ..dataset.sm_dataset import ChartParser
+        parser = ChartParser(
+            args, tokenizer
+        )
+    
     dataset = {
         "train": get_dataset(
             args=args,
