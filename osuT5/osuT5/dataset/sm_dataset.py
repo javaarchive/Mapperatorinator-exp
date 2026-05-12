@@ -3,15 +3,17 @@ from decimal import Decimal
 
 from .osu_parser import OsuParser
 from .mmrs_dataset import BeatmapDatasetIterable, LABEL_IGNORE_ID
-from .data_utils import load_audio_file, merge_events, remove_events_of_type, get_song_length
+from .data_utils import load_audio_file, merge_events, remove_events_of_type, get_song_length, speed_events
 
 from ..tokenizer import Tokenizer
 from ..config import DataConfig, TrainConfig
-from ..event import Event, EventType
+from ..event import ContextType, Event, EventType
 
 from torch.utils.data import IterableDataset
 
 from pathlib import Path
+
+from typing import Optional, Callable
 
 import os
 import random
@@ -54,8 +56,15 @@ class SMTimingPoint:
     # unusued I think?
     volume: int = 100
     kiai_mode: bool = False
+    meter: int = 4
 
-from typing import Optional, Callable
+    bpm_override: Optional[float] = None
+
+    @property
+    def bpm(self):
+        if self.bpm_override is not None:
+            return self.bpm_override
+        return 60000.0 / self.ms_per_beat
 
 EPSILON_MS = 2
 EPSILON = 0.002
@@ -84,17 +93,29 @@ class ChartParser(OsuParser):
             bpm_change: BeatValue = bpm_change
             time_start = timing_engine.time_at(bpm_change.beat)
             ms_per_beat = float((Decimal("60.0") * Decimal("1000.0")) / bpm_change.value)
-            timing_points.append(SMTimingPoint(offset = timedelta(milliseconds = time_start * 1000.0), ms_per_beat = ms_per_beat))
+            timing_points.append(SMTimingPoint(offset = timedelta(milliseconds = time_start * 1000.0), ms_per_beat = ms_per_beat, bpm_override = float(bpm_change.value)))
         return timing_points
 
-    def get_duration(beatmap_subchart: SimfileSubchart) -> float:
+    def get_duration(self, beatmap_subchart: SimfileSubchart) -> float:
         last_time = max(timed_note.time for timed_note in time_notes(beatmap_subchart.note_data, beatmap_subchart.timing_data))
         sfile = beatmap_subchart.file
-        if sfile.lastsecondhint:
+        if getattr(sfile, "lastsecondhint", None):
             last_time = max(last_time, float(sfile.lastsecondhint))
-        if sfile.musiclength:
+        if getattr(sfile, "musiclength", None):
             last_time = max(last_time, float(sfile.musiclength))
         return last_time
+
+    def get_hold_note_ratio(self, beatmap_subchart: SimfileSubchart) -> float:
+        total = 0
+        hold_note_count = 0
+        for timed_note in time_notes(beatmap_subchart.note_data, beatmap_subchart.timing_data):
+            note = timed_note.note
+            if note.note_type == NoteType.HOLD_HEAD or note.note_type == NoteType.ROLL_HEAD:
+                hold_note_count += 1
+            total += 1
+        
+        assert total > 0, "No notes found in chart."
+        return hold_note_count / total
 
     def parse(
             self,
@@ -126,18 +147,22 @@ class ChartParser(OsuParser):
                 NoteType.TAIL,
             ] :
                 continue
-
+            # set column
+            column = note.column
+            # column = (columns_count - 1 - column) if flip[0] else column
+            if self.types_first:
+                events.append(Event(EventType.MANIA_COLUMN, column))
+                event_times.append(time_ms)
             self._add_time_event(
                 time_delta,
                 simfile_subchart,
                 events,
                 event_times,
             )
-            # set column
-            column = note.column
             # we don't need to do complicated calculation because the column is already an integer.
-            events.append(Event(EventType.MANIA_COLUMN, column))
-            event_times.append(time_ms)
+            if not self.types_first:
+                events.append(Event(EventType.MANIA_COLUMN, column))
+                event_times.append(time_ms)
 
             if note.note_type == NoteType.TAP:
                 events.append(Event(EventType.CIRCLE))
@@ -150,8 +175,6 @@ class ChartParser(OsuParser):
                 events.append(Event(EventType.HOLD_NOTE_END))
                 event_times.append(time_ms)
 
-
-
         # Sort events by time
         if len(events) > 0:
             # noinspection PyArgumentList
@@ -159,8 +182,11 @@ class ChartParser(OsuParser):
         result = list(events), list(event_times)
 
         if self.add_timing:
-            timing_events = self.parse_timing(self.get_timing_points(), song_length = self.get_duration(simfile_subchart) * 1000.0)
+            timing_events = self.parse_timing(ChartParser.get_timing_points(simfile_subchart), song_length = self.get_duration(simfile_subchart) * 1000.0)
             result = merge_events(timing_events, result)
+
+        if speed != 1.0:
+            result = speed_events(result, speed)
 
         return result
 
@@ -173,8 +199,8 @@ class ChartDatasetIterable(BeatmapDatasetIterable):
         return 1.0 # stub
     
     def _get_next_beatmaps(self):
-        for beatmap_path in self.metadata: # data storage hack
-            for sample in self._get_next_beatmap(beatmap_path, {}, 1.0):
+        for beatmap_idx, beatmap_path in enumerate(self.metadata): # data storage hack
+            for sample in self._get_next_beatmap(beatmap_path, {"beatmap_idx": beatmap_idx}, 1.0):
                 yield sample
 
     def _get_next_tracks(self):
@@ -188,6 +214,13 @@ class ChartDatasetIterable(BeatmapDatasetIterable):
         chart_simfile = simfile.open(beatmap_path)
 
         music_path = root_folder / chart_simfile.music
+
+        # fix case sensitivity if not using ..
+        if not ".." in chart_simfile.music:
+            filename_matches = [filename for filename in os.listdir(root_folder) if filename.lower() == chart_simfile.music.lower()]
+            assert len(filename_matches) > 0, f"Music file {chart_simfile.music} not found in {root_folder}"
+            actual_music_filename = filename_matches[0]
+            music_path = root_folder / actual_music_filename
         
         # context
         context_info = None
@@ -211,8 +244,11 @@ class ChartDatasetIterable(BeatmapDatasetIterable):
         # {"extra": {"context_type": context, "add_type": add_type, "id": identifier + '_' + context.value}}
 
         for chart_idx, chart in enumerate(chart_simfile.charts):
-            data = {"extra":{"context_type": "map", "add_type": False, "id": f"{chart_idx}_{beatmap_path.stem}_map"}}
+            data = {"extra":{"context_type": ContextType.MAP, "add_type": True, "id": f"{chart_idx}_{beatmap_path.stem}_map"}}#, "context_type": "map"}
+            
             chart: simfile.types.Chart = chart
+
+            generated_id = 1000 * metadata["beatmap_idx"] + chart_idx  
 
             simfile_subchart = SimfileSubchart.create(
                 sfile = chart_simfile,
@@ -224,31 +260,50 @@ class ChartDatasetIterable(BeatmapDatasetIterable):
             data["events"], data["event_times"] = self.parser.parse(simfile_subchart, speed, None, flip)
 
             extra_data = {
-                    "beatmap_idx": torch.tensor(1, dtype=torch.long),
-                    "mapper_idx": torch.tensor(1, dtype=torch.long),
-                    "difficulty": torch.tensor(1.0, dtype=torch.float32),
-                    "special": {
-                        "hitsounded": False,
+                "beatmap_idx": torch.tensor(generated_id, dtype=torch.long),
+                "mapper_idx": torch.tensor(1, dtype=torch.long),
+                "difficulty": torch.tensor(float(chart.meter), dtype=torch.float32),
+                "special": {
+                    "hitsounded": False,
                     "song_length": get_song_length(audio_samples, self.args.sample_rate),
                     "keycount": simfile_subchart.note_data.columns,
-                    "circle_size": simfile_subchart.note_data.columns,
+                    "hold_note_ratio": self.parser.get_hold_note_ratio(simfile_subchart),
+                    # can't use this in inference
+                    #"circle_size": simfile_subchart.note_data.columns,
                     "year": 2077,
-                    "gamemode": 3 # mania id
+                    "gamemode": 3, # mania id
+                    "beatmap_id": torch.tensor(generated_id, dtype=torch.long),
+                    "difficulty": torch.tensor(float(chart.meter), dtype=torch.float32),
+                    # "beatmap_id": 
                     # TODO: calculate hold note ratio.
                 },
             }
+
+            data_none_type = {
+                **data,
+                "events": [],
+                "event_times": [],
+                "extra": {
+                    **data["extra"],
+                    "context_type": ContextType.NONE,
+                    "add_type": True,
+                    "id": f"{chart_idx}_{beatmap_path.stem}_none",
+                },
+                # "context_type": ContextType.NONE,
+            }
+
+            print("events generated for", data["extra"]["id"], " count ", len(data["events"]))
 
             sequences = self._create_sequences(
                 frames,
                 frame_times,
                 #out_context,
                 #in_context,
-                [data],
+                [data_none_type],
                 [data],
                 extra_data
                 #extra_data,
             )
-        
 
             #for sequence in sequences:
             #    self.maybe_change_dataset()
@@ -271,10 +326,10 @@ def discover_simfiles(path: Path) -> list[Path]:
     discover_simfile_paths = []
     for dirpath, dirnames, filepaths in os.walk(path):
         if any([
-            ".sm" in filename or ".ssc" in filename for filename in filepaths
+            filename.endswith(".sm") or filename.endswith(".ssc") for filename in filepaths
         ]):
             # add
-            simfile_filename = sorted([filename for filename in filepaths if  ".sm" in filename or ".ssc" in filename])[-1]
+            simfile_filename = sorted([filename for filename in filepaths if filename.endswith(".sm") or filename.endswith(".ssc")])[-1]
             discover_simfile_paths.append(path / dirpath / simfile_filename) # prefer ssc over sm
     
     return discover_simfile_paths
@@ -312,10 +367,15 @@ class StepmaniaDataset(IterableDataset):
         return self.simfile_paths
     
     def __iter__(self):
-        simfile_paths = self._get_simfile_paths()[:]
+        untrunc_paths = self._get_simfile_paths()[:]
 
         if not self.test:
-            random.shuffle(simfile_paths)
+            random.shuffle(untrunc_paths)
+        else:
+            random.shuffle(untrunc_paths)
+        simfile_paths = untrunc_paths[self.start:self.end]
+
+        
 
         if self.args.cycle_length > 1 and not self.test:
             return InterleavingStepmaniaDatasetIterable(
